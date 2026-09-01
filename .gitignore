@@ -12,3 +12,8 @@ venv/
 !.env.example
 secrets/
 *.log
+data/
+
+# Notebook outputs can reveal the public profile and betting history.
+notebooks/.ipynb_checkpoints/
+notebooks/*.local.ipynb

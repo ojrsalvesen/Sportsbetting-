@@ -134,6 +134,62 @@ class FixtureDiscoveryTests(unittest.TestCase):
         self.assertIn("YES", terminal)
         self.assertIn("NO", terminal)
 
+    def test_pinnacle_gap_uses_full_stake_vwap_instead_of_best_ask(self) -> None:
+        fixture = moneyline_fixture_from_event(raw_event(), now=NOW)
+        assert fixture is not None
+
+        class FakeClient:
+            def list_epl_events(self) -> tuple[str, list[dict[str, object]]]:
+                return "10188", [raw_event()]
+
+            def get_order_books(self, token_ids: list[str]) -> dict[str, OrderBook]:
+                condition_by_token = {
+                    token_id: outcome.market.condition_id
+                    for outcome in fixture.outcomes
+                    for _, token_id in outcome.token_ids()
+                }
+                return {
+                    token_id: OrderBook.from_api(
+                        {
+                            "asset_id": token_id,
+                            "market": condition_by_token[token_id],
+                            "timestamp": str(int(NOW.timestamp() * 1000)),
+                            "tick_size": "0.01",
+                            "min_order_size": "5",
+                            "neg_risk": True,
+                            "bids": [{"price": "0.49", "size": "10"}],
+                            "asks": [
+                                {"price": "0.51", "size": "4"},
+                                {"price": "0.52", "size": "10"},
+                            ],
+                        }
+                    )
+                    for token_id in token_ids
+                }
+
+        class FakeOddsProvider:
+            description = "test Pinnacle quote"
+
+            def quote_for(self, _: object) -> OddsQuote:
+                return OddsQuote(
+                    home_team="Fulham FC",
+                    away_team="Chelsea FC",
+                    starts_at=datetime(2026, 8, 24, 19, tzinfo=timezone.utc),
+                    captured_at=NOW,
+                    home_odds=Decimal("2"),
+                    draw_odds=Decimal("4"),
+                    away_odds=Decimal("4"),
+                )
+
+        report = build_premier_league_report(
+            FakeClient(),  # type: ignore[arg-type]
+            odds_provider=FakeOddsProvider(),  # type: ignore[arg-type]
+            now=NOW,
+        )
+        home_yes = report.fixtures[0].outcomes[0]
+        self.assertAlmostEqual(float(home_yes.price_gap or 0), -0.015875, places=5)
+        self.assertNotEqual(home_yes.price_gap, Decimal("0.5") - Decimal("0.51"))
+
     def test_non_moneyline_and_started_events_are_excluded(self) -> None:
         event = raw_event()
         event["endDate"] = "2026-08-23T19:00:00Z"

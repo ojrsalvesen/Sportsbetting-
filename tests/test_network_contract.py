@@ -5,6 +5,8 @@ import unittest
 
 from polymarket_bot.market_data import PolymarketPublicClient
 from polymarket_bot.reporting import discover_fixtures
+from polymarket_bot.history import PolymarketHistoryClient
+from polymarket_bot.xg import UnderstatXgClient
 
 
 @unittest.skipUnless(
@@ -27,6 +29,19 @@ class PublicNetworkContractTests(unittest.TestCase):
             books = client.get_order_books(token_ids)
         self.assertEqual(set(books), set(token_ids))
         self.assertTrue(all(book.tick_size > 0 for book in books.values()))
+
+    def test_analytics_event_and_xg_shapes(self) -> None:
+        with PolymarketPublicClient(timeout_seconds=20) as market_client:
+            _, raw_events = market_client.list_epl_events()
+            fixtures, _ = discover_fixtures(raw_events)
+        self.assertTrue(fixtures, "No upcoming EPL fixture available for analytics contract")
+        with PolymarketHistoryClient(timeout_seconds=20) as history_client:
+            event = history_client.event(fixtures[0].slug)
+        with UnderstatXgClient(timeout_seconds=20) as xg_client:
+            matches = xg_client.matches(2026)
+        self.assertEqual(set(event.condition_roles.values()), {"home", "draw", "away"})
+        self.assertTrue(matches, "No completed EPL xG matches returned")
+        self.assertTrue(all(match.home_xg >= 0 and match.away_xg >= 0 for match in matches))
 
 
 if __name__ == "__main__":

@@ -45,7 +45,16 @@ def normalize_team(value: str) -> str:
         "man united": "manchester united",
         "nottm forest": "nottingham forest",
         "spurs": "tottenham hotspur",
+        "tottenham": "tottenham hotspur",
         "brighton": "brighton and hove albion",
+        "bournemouth": "bournemouth",
+        "coventry": "coventry city",
+        "hull": "hull city",
+        "ipswich": "ipswich town",
+        "leeds": "leeds united",
+        "newcastle": "newcastle united",
+        "west ham": "west ham united",
+        "wolves": "wolverhampton wanderers",
     }
     return aliases.get(normalized, normalized)
 
@@ -578,7 +587,11 @@ def build_premier_league_report(
                     if yes_fair is not None
                     else None
                 )
-                best_ask = metrics.best_ask if metrics else None
+                execution_price = (
+                    metrics.buy_vwap
+                    if metrics and metrics.fillable_spend_usd >= stake_usd
+                    else None
+                )
                 outcome_reports.append(
                     OutcomeReport(
                         outcome=outcome,
@@ -588,8 +601,8 @@ def build_premier_league_report(
                         error=error,
                         pinnacle_fair_probability=fair,
                         price_gap=(
-                            fair - best_ask
-                            if fair is not None and best_ask is not None
+                            fair - execution_price
+                            if fair is not None and execution_price is not None
                             else None
                         ),
                     )
@@ -641,7 +654,7 @@ def render_terminal(report: PremierLeagueReport) -> str:
     header = (
         f"{_terminal_cell('Outcome', 27)} "
         f"{'Tok':<3} {'Bid':>6} {'Ask':>6} {'Spr':>6} "
-        f"{'Bid$2c':>10} {'Ask$2c':>10} {'$5VWAP':>7} "
+        f"{'Bid$2c':>10} {'Ask$2c':>10} {'BuyVWAP':>7} "
         f"{'PinFair':>8} {'Gap':>8}"
     )
     divider = "-" * len(header)
@@ -685,7 +698,8 @@ def render_terminal(report: PremierLeagueReport) -> str:
         [
             "",
             "Bid$2c/Ask$2c = visible USD depth within 2 cents of the best price.",
-            "$5VWAP walks visible asks for a $5 purchase. PinFair is margin-normalized.",
+            f"BuyVWAP walks visible asks for the configured ${report.stake_usd:.2f} purchase.",
+            "PinFair is margin-normalized. Gap = PinFair - BuyVWAP; it is not a profit forecast.",
         ]
     )
     return "\n".join(lines)
