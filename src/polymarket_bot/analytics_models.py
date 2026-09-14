@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
@@ -129,6 +129,7 @@ class MarketEvent:
     home_team: str
     away_team: str
     condition_roles: dict[str, str]
+    winning_outcomes: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -146,20 +147,16 @@ class MatchXg:
 
 
 @dataclass(frozen=True)
-class TeamForm:
-    matches: int
-    xg_for: Decimal
-    xg_against: Decimal
-
-
-@dataclass(frozen=True)
 class AnalyzedBet:
     trade: BetTrade
     event: MarketEvent | None
     match: MatchXg | None
     role: str | None
     token_side: str | None
+    market_type: str
+    direction_team: str | None
+    direction_opponent: str | None
+    direction_is_home: bool | None
     result: str
+    resolution_source: str | None
     hold_pnl: Decimal | None
-    home_form: TeamForm | None
-    away_form: TeamForm | None

@@ -93,21 +93,30 @@ class PolymarketPublicClient:
         return books
 
     def epl_series_id(self) -> str:
+        return self.sports_series_id("epl")
+
+    def sports_series_id(self, competition: str) -> str:
+        if competition not in {"epl", "ucl"}:
+            raise MarketResolutionError("Unsupported football competition")
         sports = self._get(f"{GAMMA_URL}/sports")
         if not isinstance(sports, list):
             raise ApiError("Sports endpoint returned an unexpected response")
         matches = [
             sport
             for sport in sports
-            if isinstance(sport, dict) and str(sport.get("sport", "")).casefold() == "epl"
+            if isinstance(sport, dict) and str(sport.get("sport", "")).casefold() == competition
         ]
         if len(matches) != 1 or not str(matches[0].get("series", "")).strip():
-            raise MarketResolutionError("Could not identify the active EPL sports series")
+            raise MarketResolutionError(f"Could not identify the active {competition.upper()} sports series")
         return str(matches[0]["series"])
 
     def list_epl_events(self, *, max_pages: int = 20) -> tuple[str, list[dict[str, Any]]]:
         """Return every active event currently attached to Polymarket's EPL series."""
-        series_id = self.epl_series_id()
+        return self.list_competition_events("epl", max_pages=max_pages)
+
+    def list_competition_events(self, competition: str, *, max_pages: int = 20) -> tuple[str, list[dict[str, Any]]]:
+        """Discover the series dynamically and page through all listed events."""
+        series_id = self.sports_series_id(competition)
         events: list[dict[str, Any]] = []
         page_size = 100  # Gamma currently caps list responses at 100.
         for page in range(max_pages):
@@ -127,7 +136,7 @@ class PolymarketPublicClient:
             events.extend(valid)
             if len(data) < page_size:
                 return series_id, events
-        raise ApiError("EPL event pagination exceeded the safety limit")
+        raise ApiError(f"{competition.upper()} event pagination exceeded the safety limit")
 
 def _market_info(raw: dict[str, Any], token_id: str) -> MarketInfo:
     return MarketInfo(

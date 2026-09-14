@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -9,12 +10,15 @@ from polymarket_bot.analytics_models import (
     BetTrade,
     MarketEvent,
     MatchXg,
-    TeamForm,
 )
 from polymarket_bot.reporting import normalize_team
 
 
 ZERO = Decimal("0")
+SPREAD_PATTERN = re.compile(
+    r"^Spread:\s*(?P<team>.+?)\s*\(\s*(?P<line>[+\-−]?\d+(?:\.\d+)?)\s*\)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _same_team(left: str, right: str) -> bool:
@@ -34,26 +38,16 @@ def match_xg_fixture(event: MarketEvent, matches: list[MatchXg]) -> MatchXg | No
     return min(candidates, key=lambda match: abs(event.kickoff - match.kickoff))
 
 
-def team_form(
-    team: str, *, before: datetime, matches: list[MatchXg], window: int = 5
-) -> TeamForm | None:
-    observations: list[tuple[datetime, Decimal, Decimal]] = []
-    for match in matches:
-        if match.kickoff >= before:
-            continue
-        if _same_team(team, match.home_team):
-            observations.append((match.kickoff, match.home_xg, match.away_xg))
-        elif _same_team(team, match.away_team):
-            observations.append((match.kickoff, match.away_xg, match.home_xg))
-    selected = sorted(observations, key=lambda item: item[0], reverse=True)[:window]
-    if not selected:
-        return None
-    count = Decimal(len(selected))
-    return TeamForm(
-        matches=len(selected),
-        xg_for=sum((item[1] for item in selected), ZERO) / count,
-        xg_against=sum((item[2] for item in selected), ZERO) / count,
-    )
+def xg_matches_for_events(
+    events: list[MarketEvent], matches: list[MatchXg]
+) -> list[MatchXg]:
+    """Return one completed xG match for each represented fixture."""
+    selected: dict[str, MatchXg] = {}
+    for event in events:
+        match = match_xg_fixture(event, matches)
+        if match is not None:
+            selected[match.match_id] = match
+    return sorted(selected.values(), key=lambda match: (match.kickoff, match.match_id))
 
 
 def _actual_role(match: MatchXg) -> str:
@@ -75,6 +69,110 @@ def _token_side(trade: BetTrade) -> str | None:
     return None
 
 
+def market_type_for_trade(trade: BetTrade, role: str | None) -> str:
+    if role is not None:
+        return "Full-time 1X2"
+    title = trade.title.casefold()
+    if "both teams to score" in title:
+        return "Both teams to score"
+    if SPREAD_PATTERN.match(trade.title):
+        return "Spread"
+    if any(word in title for word in ("champion", "championship", "winner")):
+        return "Season winner"
+    return "Other football market"
+
+
+def _official_token_won(trade: BetTrade, event: MarketEvent) -> bool | None:
+    winner = event.winning_outcomes.get(trade.condition_id)
+    if not winner or not trade.outcome:
+        return None
+    return normalize_team(winner) == normalize_team(trade.outcome)
+
+
+def _spread_token_won(
+    trade: BetTrade, event: MarketEvent, match: MatchXg
+) -> bool | None:
+    spread = SPREAD_PATTERN.match(trade.title)
+    if spread is None:
+        return None
+    named_team = spread.group("team")
+    line = Decimal(spread.group("line").replace("−", "-"))
+    if _same_team(named_team, event.home_team):
+        named_goals, opponent_goals = match.home_goals, match.away_goals
+        opponent = event.away_team
+    elif _same_team(named_team, event.away_team):
+        named_goals, opponent_goals = match.away_goals, match.home_goals
+        opponent = event.home_team
+    else:
+        return None
+
+    if _same_team(trade.outcome, named_team):
+        selected_named_team = True
+    elif _same_team(trade.outcome, opponent):
+        selected_named_team = False
+    else:
+        return None
+
+    adjusted_named_goals = Decimal(named_goals) + line
+    if adjusted_named_goals == opponent_goals:
+        return None
+    named_team_covered = adjusted_named_goals > opponent_goals
+    return named_team_covered == selected_named_team
+
+
+def _score_based_token_won(
+    trade: BetTrade,
+    event: MarketEvent,
+    match: MatchXg,
+    role: str | None,
+    market_type: str,
+) -> bool | None:
+    if role is not None:
+        token_side = _token_side(trade)
+        if token_side is None:
+            return None
+        proposition_won = _actual_role(match) == role
+        return proposition_won if token_side == "YES" else not proposition_won
+    if market_type == "Both teams to score":
+        token_side = _token_side(trade)
+        if token_side is None:
+            return None
+        proposition_won = match.home_goals > 0 and match.away_goals > 0
+        return proposition_won if token_side == "YES" else not proposition_won
+    if market_type == "Spread":
+        return _spread_token_won(trade, event, match)
+    return None
+
+
+def _directional_teams(
+    trade: BetTrade,
+    event: MarketEvent,
+    role: str | None,
+    market_type: str,
+) -> tuple[str, str, bool] | None:
+    if role in {"home", "away"}:
+        proposition_is_home = role == "home"
+        token_side = _token_side(trade)
+        if token_side not in {"YES", "NO"}:
+            return None
+        direction_is_home = (
+            proposition_is_home if token_side == "YES" else not proposition_is_home
+        )
+    elif market_type == "Spread":
+        if _same_team(trade.outcome, event.home_team):
+            direction_is_home = True
+        elif _same_team(trade.outcome, event.away_team):
+            direction_is_home = False
+        else:
+            return None
+    else:
+        return None
+
+    if direction_is_home:
+        return event.home_team, event.away_team, True
+    return event.away_team, event.home_team, False
+
+
 def analyze_bets(
     trades: list[BetTrade],
     events: dict[str, MarketEvent],
@@ -87,15 +185,24 @@ def analyze_bets(
         event = events.get(trade.event_slug)
         role = event.condition_roles.get(trade.condition_id) if event else None
         token_side = _token_side(trade) if role else (trade.outcome.upper() or None)
+        market_type = market_type_for_trade(trade, role)
+        direction = (
+            _directional_teams(trade, event, role, market_type) if event else None
+        )
         match = match_xg_fixture(event, matches) if event else None
-        home_form = team_form(event.home_team, before=event.kickoff, matches=matches) if event else None
-        away_form = team_form(event.away_team, before=event.kickoff, matches=matches) if event else None
-
         result = "PENDING"
+        resolution_source: str | None = None
         hold_pnl: Decimal | None = None
-        if match and role and token_side:
-            proposition_won = _actual_role(match) == role
-            token_won = proposition_won if token_side == "YES" else not proposition_won
+        token_won = _official_token_won(trade, event) if event else None
+        if token_won is not None:
+            resolution_source = "Polymarket"
+        if token_won is None and event and match:
+            token_won = _score_based_token_won(
+                trade, event, match, role, market_type
+            )
+            if token_won is not None:
+                resolution_source = "Final-score fallback"
+        if token_won is not None:
             result = "WIN" if token_won else "LOSS"
             hold_pnl = trade.size - trade.usdc_size if token_won else -trade.usdc_size
         analyzed.append(
@@ -105,10 +212,13 @@ def analyze_bets(
                 match=match,
                 role=role,
                 token_side=token_side,
+                market_type=market_type,
+                direction_team=direction[0] if direction else None,
+                direction_opponent=direction[1] if direction else None,
+                direction_is_home=direction[2] if direction else None,
                 result=result,
+                resolution_source=resolution_source,
                 hold_pnl=hold_pnl,
-                home_form=home_form,
-                away_form=away_form,
             )
         )
     return analyzed
@@ -151,7 +261,7 @@ def render_analytics_terminal(report: AnalyticsReport) -> str:
         if bet.result == "WIN"
     }
     lines = [
-        "Premier League bet history and xG analysis",
+        "Premier League and Champions League bet history and xG analysis",
         (
             f"Season {report.season}/{str(report.season + 1)[-2:]} | "
             f"{report.trades_stored} trades stored | {len(report.bets)} BUY fills across "
@@ -171,7 +281,7 @@ def render_analytics_terminal(report: AnalyticsReport) -> str:
     ]
     lines.extend(f"WARNING: {warning}" for warning in report.warnings)
     if not report.bets:
-        lines.append("\nNo EPL BUY trades were found for this season.")
+        lines.append("\nNo EPL or UCL BUY trades were found for this season.")
         return "\n".join(lines)
 
     header = (
@@ -195,27 +305,11 @@ def render_analytics_terminal(report: AnalyticsReport) -> str:
             f"{(f'${bet.hold_pnl:+.2f}' if bet.hold_pnl is not None else 'n/a'):>9} "
             f"{post_xg:>11}"
         )
-        if bet.event:
-            home_form = (
-                f"{bet.home_form.xg_for:.2f}/{bet.home_form.xg_against:.2f} "
-                f"({bet.home_form.matches})"
-                if bet.home_form
-                else "n/a"
-            )
-            away_form = (
-                f"{bet.away_form.xg_for:.2f}/{bet.away_form.xg_against:.2f} "
-                f"({bet.away_form.matches})"
-                if bet.away_form
-                else "n/a"
-            )
-            lines.append(
-                f"             rolling xGF/xGA: {bet.event.home_team} {home_form}; "
-                f"{bet.event.away_team} {away_form}"
-            )
     lines.extend(
         [
             "",
-            "Rolling xG is descriptive context only; figures in parentheses are sample sizes.",
+            "Post xG is shown only for completed fixtures represented in the betting ledger.",
+            "Resolved outcomes come from Polymarket; final scores provide an offline fallback for 1X2, BTTS, and spreads.",
             "HoldPL assumes each BUY fill was held to settlement. Actual realized P/L comes from closed positions.",
             "Understat is a free unofficial source and may change or become unavailable.",
         ]

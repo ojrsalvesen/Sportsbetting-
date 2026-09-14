@@ -7,12 +7,18 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from polymarket_bot.analysis import AnalyticsReport, analyze_bets, render_analytics_terminal
+from polymarket_bot.analysis import (
+    AnalyticsReport,
+    analyze_bets,
+    render_analytics_terminal,
+    xg_matches_for_events,
+)
 from polymarket_bot.errors import ApiError, BotError, ConfigError
 from polymarket_bot.history import (
     AnalyticsStore,
     PolymarketHistoryClient,
-    is_season_epl_fixture_slug,
+    SUPPORTED_COMPETITIONS,
+    is_season_competition_slug,
     validate_profile_address,
 )
 from polymarket_bot.xg import UnderstatXgClient
@@ -54,8 +60,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bet-analytics",
         description=(
-            "Synchronize public Premier League Polymarket trades into SQLite and "
-            "review BUY fills with rolling and post-match xG context"
+            "Synchronize public Premier League and Champions League Polymarket trades into SQLite and "
+            "review BUY fills with post-match xG for represented fixtures"
         ),
     )
     parser.add_argument(
@@ -120,70 +126,107 @@ def _run_cycle(args: argparse.Namespace, store: AnalyticsStore, user: str) -> st
     if not args.offline:
         with PolymarketHistoryClient(timeout_seconds=args.timeout_seconds) as client:
             try:
-                remote_trades = client.trades_for_season(user, args.season)
+                remote_trades = client.trades_for_season(
+                    user, args.season, competitions=SUPPORTED_COMPETITIONS
+                )
                 inserted, received = store.upsert_trades(remote_trades)
                 print(
-                    f"Polymarket sync: {received} EPL trades received, "
+                    f"Polymarket sync: {received} EPL/UCL trades received, "
                     f"{inserted} newly stored.",
                     flush=True,
                 )
             except ApiError as error:
-                if not store.trades(user, args.season):
+                if not store.trades(
+                    user, args.season, competitions=SUPPORTED_COMPETITIONS
+                ):
                     raise
                 warnings.append(f"Trade sync failed; using cached data: {error}")
 
             try:
-                positions = client.closed_positions_for_season(user, args.season)
+                positions = client.closed_positions_for_season(
+                    user, args.season, competitions=SUPPORTED_COMPETITIONS
+                )
                 store.upsert_closed_positions(positions)
             except ApiError as error:
                 warnings.append(f"Closed-position sync failed: {error}")
 
-            local_trades = store.trades(user, args.season)
-            cached_events = store.events()
-            missing_slugs = sorted(
-                {
-                    trade.event_slug
-                    for trade in local_trades
-                    if is_season_epl_fixture_slug(trade.event_slug, args.season)
-                }.difference(cached_events)
+            local_trades = store.trades(
+                user, args.season, competitions=SUPPORTED_COMPETITIONS
             )
-            for event_slug in missing_slugs:
+            cached_events = store.events()
+            fixture_conditions: dict[str, set[str]] = {}
+            for trade in local_trades:
+                if trade.side != "BUY" or not is_season_competition_slug(
+                    trade.event_slug,
+                    args.season,
+                    competitions=SUPPORTED_COMPETITIONS,
+                ):
+                    continue
+                fixture_conditions.setdefault(trade.event_slug, set()).add(
+                    trade.condition_id
+                )
+            refresh_slugs = sorted(
+                slug
+                for slug, condition_ids in fixture_conditions.items()
+                if slug not in cached_events
+                or not condition_ids.issubset(cached_events[slug].winning_outcomes)
+            )
+            for event_slug in refresh_slugs:
                 try:
                     store.upsert_event(client.event(event_slug))
                 except BotError as error:
                     warnings.append(f"Event metadata unavailable for {event_slug}: {error}")
 
+        local_trades = store.trades(
+            user, args.season, competitions=SUPPORTED_COMPETITIONS
+        )
+        cached_events = store.events()
+        traded_slugs = {
+            trade.event_slug for trade in local_trades if trade.side == "BUY"
+        }
+        bet_events = [
+            cached_events[slug]
+            for slug in traded_slugs
+            if slug in cached_events
+        ]
         synced_matches = 0
-        with UnderstatXgClient(timeout_seconds=args.timeout_seconds) as xg_client:
-            for xg_season in (args.season - 1, args.season):
-                try:
-                    remote_matches = xg_client.matches(xg_season)
-                    synced_matches += store.upsert_xg_matches(remote_matches)
-                except ApiError as error:
-                    warnings.append(
-                        f"{xg_season}/{str(xg_season + 1)[-2:]} xG sync failed; "
-                        f"using cached data: {error}"
-                    )
+        if bet_events:
+            try:
+                with UnderstatXgClient(timeout_seconds=args.timeout_seconds) as xg_client:
+                    remote_matches = xg_client.matches(args.season)
+                relevant_matches = xg_matches_for_events(bet_events, remote_matches)
+                synced_matches = store.upsert_xg_matches(relevant_matches)
+            except ApiError as error:
+                warnings.append(
+                    f"{args.season}/{str(args.season + 1)[-2:]} xG sync failed; "
+                    f"using cached data: {error}"
+                )
         print(
-            f"xG sync: {synced_matches} completed EPL matches stored "
-            f"across the current and previous seasons.",
+            f"xG sync: {synced_matches} completed bet fixtures stored/refreshed "
+            f"for {args.season}/{str(args.season + 1)[-2:]}.",
             flush=True,
         )
 
-    trades = store.trades(user, args.season)
+    trades = store.trades(user, args.season, competitions=SUPPORTED_COMPETITIONS)
     events = store.events()
-    current_matches = store.xg_matches(args.season)
-    matches = store.xg_matches(args.season - 1) + current_matches
-    position_count, realized_pnl = store.realized_pnl(user, args.season)
+    traded_slugs = {trade.event_slug for trade in trades if trade.side == "BUY"}
+    bet_events = [events[slug] for slug in traded_slugs if slug in events]
+    matches = xg_matches_for_events(bet_events, store.xg_matches(args.season))
+    position_count, realized_pnl = store.realized_pnl(
+        user, args.season, competitions=SUPPORTED_COMPETITIONS
+    )
     if trades and not events:
         warnings.append("No event metadata is available; market roles cannot be analyzed")
-    if not current_matches:
-        warnings.append("No completed xG matches are stored for this season")
+    if bet_events and not matches:
+        warnings.append("No completed xG is available yet for represented bet fixtures")
     analyzed = analyze_bets(trades, events, matches)
-    unsupported = sum(bet.role is None for bet in analyzed)
-    if unsupported:
+    unclassified_completed = sum(
+        bet.match is not None and bet.result == "PENDING" for bet in analyzed
+    )
+    if unclassified_completed:
         warnings.append(
-            f"{unsupported} BUY fills are outside full-time 1X2; stored without match/xG context"
+            f"{unclassified_completed} BUY fills from completed fixtures could not be "
+            "classified; inspect their market rules before using hold P/L"
         )
     report = AnalyticsReport(
         generated_at=datetime.now(timezone.utc),

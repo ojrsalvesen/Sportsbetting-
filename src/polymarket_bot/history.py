@@ -5,7 +5,7 @@ import re
 import sqlite3
 from collections.abc import Iterable
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +28,39 @@ def validate_profile_address(value: str) -> str:
     return address
 
 
+def _api_array(value: Any) -> list[Any]:
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except ValueError:
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _resolved_winner(market: dict[str, Any]) -> str | None:
+    if market.get("closed") is not True:
+        return None
+    if str(market.get("umaResolutionStatus", "")).casefold() != "resolved":
+        return None
+    outcomes = _api_array(market.get("outcomes"))
+    prices = _api_array(market.get("outcomePrices"))
+    if len(outcomes) != len(prices):
+        return None
+    try:
+        winning_indexes = [
+            index for index, price in enumerate(prices) if Decimal(str(price)) == 1
+        ]
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if len(winning_indexes) != 1:
+        return None
+    winner = str(outcomes[winning_indexes[0]]).strip()
+    return winner or None
+
+
 def season_bounds(season: int) -> tuple[datetime, datetime]:
     if not 2014 <= season <= 2100:
         raise ConfigError("Season must be its four-digit starting year")
@@ -38,7 +71,7 @@ def season_bounds(season: int) -> tuple[datetime, datetime]:
 
 
 def _event_date_from_slug(slug: str) -> datetime | None:
-    match = re.search(r"-(\d{4})-(\d{2})-(\d{2})$", slug)
+    match = re.search(r"-(\d{4})-(\d{2})-(\d{2})(?:-|$)", slug)
     if match is None:
         return None
     try:
@@ -70,6 +103,42 @@ def is_season_epl_fixture_slug(slug: str, season: int) -> bool:
         return False
     start, end = season_bounds(season)
     return start <= event_date < end
+
+
+SUPPORTED_COMPETITIONS = ("epl", "ucl")
+DEFAULT_HISTORY_COMPETITIONS = ("epl",)
+COMPETITION_SLUG_PREFIXES = {
+    "epl": ("epl-",),
+    "ucl": ("ucl-", "champions-league-", "uefa-champions-league-"),
+}
+
+
+def is_season_competition_slug(
+    slug: str,
+    season: int,
+    *,
+    competitions: tuple[str, ...] = SUPPORTED_COMPETITIONS,
+    timestamp: int | None = None,
+) -> bool:
+    """Return whether a Polymarket football slug belongs to this season/scope."""
+    normalized = tuple(item.casefold() for item in competitions)
+    if any(item not in SUPPORTED_COMPETITIONS for item in normalized):
+        raise ConfigError("Unsupported football competition")
+    lowered_slug = slug.casefold()
+    if not any(
+        lowered_slug.startswith(prefix)
+        for item in normalized
+        for prefix in COMPETITION_SLUG_PREFIXES[item]
+    ):
+        return False
+    start, end = season_bounds(season)
+    event_date = _event_date_from_slug(slug)
+    if event_date is not None:
+        return start <= event_date < end
+    if timestamp is None:
+        return True
+    placed_at = datetime.fromtimestamp(timestamp, tz=timezone.utc)
+    return start <= placed_at < end
 
 
 class PolymarketHistoryClient:
@@ -119,7 +188,13 @@ class PolymarketHistoryClient:
                 return rows
         raise ApiError(f"Polymarket {path} pagination exceeded {max_offset:,} records")
 
-    def trades_for_season(self, user: str, season: int) -> list[BetTrade]:
+    def trades_for_season(
+        self,
+        user: str,
+        season: int,
+        *,
+        competitions: tuple[str, ...] = DEFAULT_HISTORY_COMPETITIONS,
+    ) -> list[BetTrade]:
         address = validate_profile_address(user)
         start, end = season_bounds(season)
         rows = self._pages(
@@ -136,11 +211,17 @@ class PolymarketHistoryClient:
         trades: list[BetTrade] = []
         for row in rows:
             slug = str(row.get("eventSlug", "")).strip()
-            if is_season_epl_slug(slug, season):
+            if is_season_competition_slug(slug, season, competitions=competitions):
                 trades.append(BetTrade.from_api(row, user=address))
         return trades
 
-    def closed_positions_for_season(self, user: str, season: int) -> list[ClosedPosition]:
+    def closed_positions_for_season(
+        self,
+        user: str,
+        season: int,
+        *,
+        competitions: tuple[str, ...] = DEFAULT_HISTORY_COMPETITIONS,
+    ) -> list[ClosedPosition]:
         address = validate_profile_address(user)
         rows = self._pages(
             "closed-positions",
@@ -152,8 +233,11 @@ class PolymarketHistoryClient:
         return [
             position
             for position in positions
-            if is_season_epl_slug(
-                position.event_slug, season, timestamp=position.timestamp
+            if is_season_competition_slug(
+                position.event_slug,
+                season,
+                competitions=competitions,
+                timestamp=position.timestamp,
             )
         ]
 
@@ -171,15 +255,21 @@ class PolymarketHistoryClient:
             data.get("eventStartTime") or data.get("endDate"), field_name="event kickoff"
         )
         condition_roles: dict[str, str] = {}
+        winning_outcomes: dict[str, str] = {}
         markets = data.get("markets")
         if not isinstance(markets, list):
             raise ConfigError(f"Polymarket event {event_slug} has no markets")
         home_key = normalize_team(home_team)
         away_key = normalize_team(away_team)
         for market in markets:
-            if not isinstance(market, dict) or market.get("sportsMarketType") != "moneyline":
+            if not isinstance(market, dict):
                 continue
             condition_id = str(market.get("conditionId", "")).strip()
+            winner = _resolved_winner(market)
+            if condition_id and winner:
+                winning_outcomes[condition_id] = winner
+            if market.get("sportsMarketType") != "moneyline":
+                continue
             group_title = str(market.get("groupItemTitle", "")).strip()
             question = str(market.get("question", "")).casefold()
             group_key = normalize_team(group_title)
@@ -200,6 +290,7 @@ class PolymarketHistoryClient:
             home_team=home_team,
             away_team=away_team,
             condition_roles=condition_roles,
+            winning_outcomes=winning_outcomes,
         )
 
 
@@ -269,6 +360,7 @@ class AnalyticsStore:
                 home_team TEXT NOT NULL,
                 away_team TEXT NOT NULL,
                 condition_roles_json TEXT NOT NULL,
+                winning_outcomes_json TEXT NOT NULL DEFAULT '{}',
                 synced_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS xg_matches (
@@ -287,6 +379,17 @@ class AnalyticsStore:
             CREATE INDEX IF NOT EXISTS xg_season_time ON xg_matches(season, kickoff_utc);
             """
         )
+        event_columns = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(market_events)")
+        }
+        if "winning_outcomes_json" not in event_columns:
+            self.connection.execute(
+                """
+                ALTER TABLE market_events
+                ADD COLUMN winning_outcomes_json TEXT NOT NULL DEFAULT '{}'
+                """
+            )
         self.connection.commit()
 
     @staticmethod
@@ -364,13 +467,17 @@ class AnalyticsStore:
         with self.connection:
             self.connection.execute(
                 """
-                INSERT INTO market_events VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO market_events (
+                    event_slug, title, kickoff_utc, home_team, away_team,
+                    condition_roles_json, winning_outcomes_json, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(event_slug) DO UPDATE SET
                     title=excluded.title,
                     kickoff_utc=excluded.kickoff_utc,
                     home_team=excluded.home_team,
                     away_team=excluded.away_team,
                     condition_roles_json=excluded.condition_roles_json,
+                    winning_outcomes_json=excluded.winning_outcomes_json,
                     synced_at=excluded.synced_at
                 """,
                 (
@@ -380,6 +487,7 @@ class AnalyticsStore:
                     event.home_team,
                     event.away_team,
                     json.dumps(event.condition_roles, sort_keys=True),
+                    json.dumps(event.winning_outcomes, sort_keys=True),
                     self._now(),
                 ),
             )
@@ -438,13 +546,23 @@ class AnalyticsStore:
                 (address, self._now()),
             )
 
-    def trades(self, user: str, season: int) -> list[BetTrade]:
+    def trades(
+        self,
+        user: str,
+        season: int,
+        *,
+        competitions: tuple[str, ...] = DEFAULT_HISTORY_COMPETITIONS,
+    ) -> list[BetTrade]:
         start, end = season_bounds(season)
         rows = self.connection.execute(
-            "SELECT * FROM trades WHERE user=? AND timestamp>=? AND timestamp<? ORDER BY timestamp",
+            """
+            SELECT * FROM trades
+            WHERE user=? AND timestamp>=? AND timestamp<?
+            ORDER BY timestamp
+            """,
             (user.lower(), int(start.timestamp()), int(end.timestamp())),
         ).fetchall()
-        return [
+        trades = [
             BetTrade(
                 id=row["id"],
                 user=row["user"],
@@ -464,6 +582,16 @@ class AnalyticsStore:
             )
             for row in rows
         ]
+        return [
+            trade
+            for trade in trades
+            if is_season_competition_slug(
+                trade.event_slug,
+                season,
+                competitions=competitions,
+                timestamp=trade.timestamp,
+            )
+        ]
 
     def events(self) -> dict[str, MarketEvent]:
         rows = self.connection.execute("SELECT * FROM market_events").fetchall()
@@ -475,6 +603,7 @@ class AnalyticsStore:
                 home_team=row["home_team"],
                 away_team=row["away_team"],
                 condition_roles=json.loads(row["condition_roles_json"]),
+                winning_outcomes=json.loads(row["winning_outcomes_json"]),
             )
             for row in rows
         }
@@ -499,7 +628,13 @@ class AnalyticsStore:
             for row in rows
         ]
 
-    def realized_pnl(self, user: str, season: int) -> tuple[int, Decimal]:
+    def realized_pnl(
+        self,
+        user: str,
+        season: int,
+        *,
+        competitions: tuple[str, ...] = DEFAULT_HISTORY_COMPETITIONS,
+    ) -> tuple[int, Decimal]:
         rows = self.connection.execute(
             "SELECT event_slug, timestamp, realized_pnl FROM closed_positions WHERE user=?",
             (user.lower(),),
@@ -507,8 +642,11 @@ class AnalyticsStore:
         selected = [
             row
             for row in rows
-            if is_season_epl_slug(
-                row["event_slug"], season, timestamp=row["timestamp"]
+            if is_season_competition_slug(
+                row["event_slug"],
+                season,
+                competitions=competitions,
+                timestamp=row["timestamp"],
             )
         ]
         return len(selected), sum((Decimal(row["realized_pnl"]) for row in selected), Decimal("0"))
