@@ -97,6 +97,9 @@ def _spread_token_won(
         return None
     named_team = spread.group("team")
     line = Decimal(spread.group("line").replace("−", "-"))
+    # Whole/quarter lines can push or split stakes; they are not binary payouts.
+    if abs(line) % 1 != Decimal("0.5"):
+        return None
     if _same_team(named_team, event.home_team):
         named_goals, opponent_goals = match.home_goals, match.away_goals
         opponent = event.away_team
@@ -127,6 +130,8 @@ def _score_based_token_won(
     role: str | None,
     market_type: str,
 ) -> bool | None:
+    if re.search(r"\b(half|period|extra\s*time|penalt\w*|1h|2h|ht|qualif\w*|advance|aggregate)\b", trade.title, re.I):
+        return None
     if role is not None:
         token_side = _token_side(trade)
         if token_side is None:
@@ -134,6 +139,8 @@ def _score_based_token_won(
         proposition_won = _actual_role(match) == role
         return proposition_won if token_side == "YES" else not proposition_won
     if market_type == "Both teams to score":
+        if not re.fullmatch(r".+\s+vs\.?\s+.+:\s*Both Teams to Score\??", trade.title, re.I):
+            return None
         token_side = _token_side(trade)
         if token_side is None:
             return None
@@ -309,7 +316,7 @@ def render_analytics_terminal(report: AnalyticsReport) -> str:
         [
             "",
             "Post xG is shown only for completed fixtures represented in the betting ledger.",
-            "Resolved outcomes come from Polymarket; final scores provide an offline fallback for 1X2, BTTS, and spreads.",
+            "Resolved outcomes come from Polymarket; final scores provide a fallback for full-match 1X2, BTTS, and half-goal spreads.",
             "HoldPL assumes each BUY fill was held to settlement. Actual realized P/L comes from closed positions.",
             "Understat is a free unofficial source and may change or become unavailable.",
         ]

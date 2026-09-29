@@ -11,6 +11,11 @@ Polymarket profile's EPL and Champions League activity, stores it in a local SQL
 ledger, and compares BUY fills and results with post-match expected goals when a
 provider has matching fixture data.
 
+This is a personal research and data-engineering project. It does not claim a
+profitable betting strategy. Post-match xG diagnostics use information that was
+not available when a bet was placed; they cannot demonstrate an entry-time edge.
+Personal results are kept outside the public repository.
+
 ## Install
 
 From PowerShell in this directory:
@@ -21,6 +26,11 @@ python -m venv .venv
 ```
 
 Python 3.11 or newer is required.
+
+On macOS/Linux, use `.venv/bin/python`, `.venv/bin/premier-league-report`, and
+`.venv/bin/bet-analytics` in place of the Windows executable paths below.
+`.env.example` documents environment variables; the CLI does not automatically
+load `.env` files.
 
 ## Run
 
@@ -102,14 +112,19 @@ API references: [Polymarket sports metadata](https://docs.polymarket.com/api-ref
 ## Test
 
 ```powershell
+.\.venv\Scripts\python.exe -m pip install -e ".[notebook]"
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
+
+The notebook extra is required for the pandas and plot tests. GitHub Actions runs
+the offline suite on Windows and Linux with Python 3.11 and 3.13.
 
 The public network contract test is opt-in:
 
 ```powershell
 $env:PMR_RUN_NETWORK_TESTS='1'
 .\.venv\Scripts\python.exe -m unittest tests.test_network_contract -v
+Remove-Item Env:PMR_RUN_NETWORK_TESTS
 ```
 
 ## Personal bet history and xG
@@ -142,6 +157,16 @@ Once a profile has been stored, later runs can omit `--user`:
 .\.venv\Scripts\bet-analytics.exe
 ```
 
+Run from the project directory: the default database path is relative to your
+working directory. Running elsewhere can create a second, empty ledger and ask
+for your profile again. Use `--database` with an absolute path when needed.
+
+Each report shows `SYNC COMPLETE`, `INCOMPLETE SYNC`, or `OFFLINE`, plus the latest
+stored trade time and the database path. A failed online refresh can still show
+cached results, but a single run now exits with code 2 if any source failed.
+Watch mode reports the failure and retries at its next interval. A recent trade
+timestamp alone is not proof that all settlements or xG have refreshed.
+
 Keep it running and synchronize automatically every six hours:
 
 ```powershell
@@ -172,10 +197,11 @@ Understat access is unofficial and may change; it is isolated behind a provider
 adapter so it can be replaced without changing the ledger.
 
 All EPL and Champions League fills remain in the audit tables. For resolved fixture markets, the
-analytics cache and uses Polymarket's official winning outcome, including BTTS,
+analytics caches and uses Polymarket's official winning outcome, including BTTS,
 spreads, and totals. When that metadata is unavailable offline, final scores
-provide a fallback for full-time 1X2, full-match BTTS, and spreads that do not
-push. A market remains `PENDING` when it is genuinely unresolved or its rules
+provide a fallback for full-time 1X2, full-match BTTS, and half-goal spreads.
+Whole/quarter-goal spreads and period-specific markets require official outcomes.
+A market remains `PENDING` when it is unresolved or its rules
 cannot be interpreted safely. Match xG is descriptive only and never determines
 settlement; closed-position realized P/L still comes from Polymarket.
 
@@ -190,9 +216,23 @@ Install the optional notebook tools:
 Keep the tracked notebook as a clean template and work in a private local copy:
 
 ```powershell
-Copy-Item .\notebooks\bet_history_analysis.ipynb .\notebooks\bet_history_analysis.local.ipynb
-.\.venv\Scripts\jupyter-lab.exe .\notebooks\bet_history_analysis.local.ipynb
+Copy-Item .\notebooks\bet_history_analysis.ipynb .\notebooks\bet_history_analysis.clean.local.ipynb
+.\.venv\Scripts\jupyter-lab.exe .\notebooks\bet_history_analysis.clean.local.ipynb
 ```
+
+Copy the template only when creating a new local notebook; do not overwrite an
+existing analysis to refresh its data. In Jupyter, select the project environment,
+restart the kernel, and run all cells after a successful `bet-analytics` sync.
+For a command-line refresh of an existing local notebook:
+
+```powershell
+.\.venv\Scripts\bet-analytics.exe
+if ($LASTEXITCODE -ne 0) { throw 'Sync incomplete; inspect the warnings before refreshing plots.' }
+.\.venv\Scripts\python.exe -m jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=600 notebooks\bet_history_analysis.clean.local.ipynb
+```
+
+If a notebook is already open, reload it after external execution to see the saved
+outputs. Use the same database, season, and profile in the CLI and notebook.
 
 You can use the project `.venv`, or install the project into an existing notebook
 environment and keep using that kernel:
@@ -222,7 +262,8 @@ address and betting history.
 ## Performance plots
 
 The local analysis notebook opens as a plots-only view with collapsed preparation
-cells and no automatic DataFrame printouts. It shows reconstructed realized EPL P/L, actual goal difference
+cells and no automatic DataFrame printouts. The template prints the cache path and
+latest stored trade time. It shows reconstructed realized EPL/UCL P/L, actual goal difference
 versus xG difference, cumulative xG for/against with net xG difference, and a
 per-match goals/xG comparison. PNGs and the underlying CSV audit tables are
 exported to the ignored `data/performance_plots/` directory when the cells run.
@@ -245,7 +286,11 @@ or the last trade date if later. This is a reconstructed realized P/L curve for 
 selected football season, not historical marked-to-market equity or wallet balance.
 Remaining unresolved inventory is listed separately; tiny share residuals from
 source rounding can remain in that table. SELLs without sufficient imported BUY
-history raise an error instead of assuming zero acquisition cost.
+history raise an error instead of assuming zero acquisition cost. This reconstruction
+assumes positions were acquired and disposed of through the imported BUY/SELL fills:
+token transfers, splits/merges, and other non-trade inventory changes are not modeled.
+Trade timestamps have second precision; ambiguous ordering within a second can
+also prevent exact cost-basis reconstruction.
 
 To rebuild the plots-only view of an existing local notebook (a backup is saved first):
 
@@ -295,3 +340,13 @@ The notebook keeps `xg_benchmark_selections`, `xg_benchmark_daily`,
 `xg_benchmark_fill_audit` and `xg_benchmark_exclusions` available without displaying
 them. Matching `xg_benchmark_*.csv` files and the two PNGs are exported alongside
 the existing plots in `data/performance_plots/`.
+
+## Publishing
+
+Publish source code and the output-free notebook template. Keep `data/`, local
+notebooks, environment files, API keys, and private screenshots out of commits.
+See [SECURITY.md](SECURITY.md) for the privacy boundary. Deleting a previously
+committed file does not remove it from Git history.
+
+The repository currently has no license file; choose one before presenting it as
+an open-source release.

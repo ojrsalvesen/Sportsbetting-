@@ -82,6 +82,13 @@ class RealizedPerformanceTests(unittest.TestCase):
         self.assertTrue(report["daily"].empty)
         self.assertTrue(directional_performance(pd.DataFrame(columns=BET_COLUMNS)).empty)
 
+    def test_dust_sale_with_zero_inventory_fails_as_missing_history(self):
+        fills = trades([("1", "a", "BUY", 10, 5, "2026-08-01"),
+                        ("2", "a", "SELL", 10, 6, "2026-08-02"),
+                        ("3", "a", "SELL", 0.000001, 0, "2026-08-03")])
+        with self.assertRaisesRegex(ConfigError, "inventory"):
+            realized_performance(fills, pd.DataFrame([bet()]))
+
 
 class DirectionalPerformanceTests(unittest.TestCase):
     def test_fragmented_fills_and_multiple_handicaps_count_one_fixture_direction(self):

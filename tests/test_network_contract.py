@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from datetime import datetime, timezone
 
 from polymarket_bot.market_data import PolymarketPublicClient
 from polymarket_bot.reporting import discover_fixtures
@@ -38,7 +39,10 @@ class PublicNetworkContractTests(unittest.TestCase):
         with PolymarketHistoryClient(timeout_seconds=20) as history_client:
             event = history_client.event(fixtures[0].slug)
         with UnderstatXgClient(timeout_seconds=20) as xg_client:
-            matches = xg_client.matches(2026)
+            now = datetime.now(timezone.utc)
+            season = now.year if now.month >= 7 else now.year - 1
+            # The previous completed season also works during the summer break.
+            matches = xg_client.matches(season - 1)
         self.assertEqual(set(event.condition_roles.values()), {"home", "draw", "away"})
         self.assertTrue(matches, "No completed EPL xG matches returned")
         self.assertTrue(all(match.home_xg >= 0 and match.away_xg >= 0 for match in matches))

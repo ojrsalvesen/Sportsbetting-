@@ -76,7 +76,7 @@ for figure in performance['figures'].values():
     plt.close(figure)
 """
     cells = [
-        nbformat.v4.new_markdown_cell("# Betting performance\n\nEPL season analysis · P/L, outcomes versus xG, and chance creation."),
+        nbformat.v4.new_markdown_cell("# Betting performance\n\nEPL/UCL P/L and EPL post-match xG diagnostics. Run bet-analytics before rerunning these cells; this notebook reads the local cache only."),
         hidden_code(preparation, DATA_TAG),
         hidden_code(plot_setup, TAG),
     ]

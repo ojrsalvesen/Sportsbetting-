@@ -13,7 +13,13 @@ venv/
 secrets/
 *.log
 data/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+build/
+dist/
 
 # Notebook outputs can reveal the public profile and betting history.
-notebooks/.ipynb_checkpoints/
+.ipynb_checkpoints/
 notebooks/*.local.ipynb

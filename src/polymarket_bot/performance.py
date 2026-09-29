@@ -78,7 +78,7 @@ def realized_performance(trades: Any, bets: Any) -> dict[str, Any]:
                 shares += size
                 basis += cash
             elif trade.side == "SELL":
-                if size > shares + Decimal("0.000001"):
+                if shares <= zero or size > shares + Decimal("0.000001"):
                     raise ConfigError(f"SELL exceeds known BUY inventory for {market}; import earlier history")
                 sold = min(size, shares)
                 cost = basis * sold / shares

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -44,8 +45,8 @@ def _positive_float(value: str) -> float:
         parsed = float(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError("must be numeric") from error
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be positive")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
     return parsed
 
 
@@ -83,7 +84,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--timeout-seconds",
         type=_positive_float,
-        default=_positive_float(os.getenv("PMA_HTTP_TIMEOUT_SECONDS", "20")),
+        default=os.getenv("PMA_HTTP_TIMEOUT_SECONDS", "20"),
     )
     parser.add_argument(
         "--offline",
@@ -98,7 +99,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--refresh-hours",
         type=_refresh_hours,
-        default=_refresh_hours(os.getenv("PMA_REFRESH_HOURS", "6")),
+        default=os.getenv("PMA_REFRESH_HOURS", "6"),
         help="watch-mode sync interval, minimum 1 hour (default: 6)",
     )
     parser.add_argument(
@@ -121,8 +122,9 @@ def _resolve_user(requested: str | None, store: AnalyticsStore) -> str:
     return validate_profile_address(input("Public Polymarket profile address (0x...): "))
 
 
-def _run_cycle(args: argparse.Namespace, store: AnalyticsStore, user: str) -> str:
+def _run_cycle(args: argparse.Namespace, store: AnalyticsStore, user: str) -> tuple[str, bool]:
     warnings: list[str] = []
+    sync_failed = False
     if not args.offline:
         with PolymarketHistoryClient(timeout_seconds=args.timeout_seconds) as client:
             try:
@@ -136,6 +138,7 @@ def _run_cycle(args: argparse.Namespace, store: AnalyticsStore, user: str) -> st
                     flush=True,
                 )
             except ApiError as error:
+                sync_failed = True
                 if not store.trades(
                     user, args.season, competitions=SUPPORTED_COMPETITIONS
                 ):
@@ -148,6 +151,7 @@ def _run_cycle(args: argparse.Namespace, store: AnalyticsStore, user: str) -> st
                 )
                 store.upsert_closed_positions(positions)
             except ApiError as error:
+                sync_failed = True
                 warnings.append(f"Closed-position sync failed: {error}")
 
             local_trades = store.trades(
@@ -175,6 +179,7 @@ def _run_cycle(args: argparse.Namespace, store: AnalyticsStore, user: str) -> st
                 try:
                     store.upsert_event(client.event(event_slug))
                 except BotError as error:
+                    sync_failed = True
                     warnings.append(f"Event metadata unavailable for {event_slug}: {error}")
 
         local_trades = store.trades(
@@ -197,6 +202,7 @@ def _run_cycle(args: argparse.Namespace, store: AnalyticsStore, user: str) -> st
                 relevant_matches = xg_matches_for_events(bet_events, remote_matches)
                 synced_matches = store.upsert_xg_matches(relevant_matches)
             except ApiError as error:
+                sync_failed = True
                 warnings.append(
                     f"{args.season}/{str(args.season + 1)[-2:]} xG sync failed; "
                     f"using cached data: {error}"
@@ -239,7 +245,15 @@ def _run_cycle(args: argparse.Namespace, store: AnalyticsStore, user: str) -> st
         bets=tuple(analyzed),
         warnings=tuple(warnings),
     )
-    return render_analytics_terminal(report)
+    if args.offline:
+        status = "OFFLINE: cached data only; no refresh attempted."
+    elif sync_failed:
+        status = "INCOMPLETE SYNC: some data could not be refreshed; see warnings below."
+    else:
+        status = "SYNC COMPLETE: requested sources refreshed."
+    latest = max((trade.placed_at for trade in trades), default=None)
+    latest_text = latest.strftime("%Y-%m-%d %H:%M UTC") if latest else "none"
+    return f"{status}\nLatest stored trade: {latest_text}\n{render_analytics_terminal(report)}", sync_failed
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -254,8 +268,11 @@ def main(argv: list[str] | None = None) -> None:
             while True:
                 if args.watch and not args.no_clear:
                     print("\033[2J\033[H", end="")
-                print(_run_cycle(args, store, user), flush=True)
+                rendered, sync_failed = _run_cycle(args, store, user)
+                print(rendered, flush=True)
                 if not args.watch:
+                    if sync_failed:
+                        raise SystemExit(2)
                     break
                 print(
                     f"\nRefreshing in {args.refresh_hours:g} hours; press Ctrl+C to stop.",

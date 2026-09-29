@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import math
 import os
 import sys
 from pathlib import Path
@@ -25,8 +26,8 @@ def _positive_float(value: str) -> float:
         parsed = float(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError("must be numeric") from error
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be positive")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
     return parsed
 
 
@@ -64,13 +65,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--stake-usd",
         type=_stake,
-        default=_stake(os.getenv("PMR_STAKE_USD", "5.00")),
+        default=os.getenv("PMR_STAKE_USD", "5.00"),
         help="purchase size for visible-ask VWAP, hard-capped at $5",
     )
     parser.add_argument(
         "--timeout-seconds",
         type=_positive_float,
-        default=_positive_float(os.getenv("PMR_HTTP_TIMEOUT_SECONDS", "20")),
+        default=os.getenv("PMR_HTTP_TIMEOUT_SECONDS", "20"),
     )
     return parser
 

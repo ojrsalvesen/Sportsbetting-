@@ -209,6 +209,23 @@ class AnalysisTests(unittest.TestCase):
         )
         self.assertIsNone(btts_result.direction_team)
 
+        for title, original in [
+            ("Manchester United vs Ipswich Town: Both Teams to Score - First Half", btts),
+            ("Manchester United vs Ipswich Town: Both Teams to Score and Win", btts),
+            ("Spread: Manchester United (-1.25)", spread),
+            ("Spread: Manchester United (-1.0)", spread),
+        ]:
+            with self.subTest(title=title):
+                unsupported = replace(original, title=title)
+                result = analyze_bets([unsupported], {event.event_slug: event}, [final_match])[0]
+                self.assertEqual(result.result, "PENDING")
+                self.assertIsNone(result.hold_pnl)
+                # An explicit official winning outcome remains authoritative.
+                resolved = replace(event, winning_outcomes={unsupported.condition_id: unsupported.outcome})
+                result = analyze_bets([unsupported], {event.event_slug: resolved}, [final_match])[0]
+                self.assertEqual(result.result, "WIN")
+                self.assertEqual(result.resolution_source, "Polymarket")
+
 
 if __name__ == "__main__":
     unittest.main()
